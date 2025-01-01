@@ -19,7 +19,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
-	"io/ioutil"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -28,8 +28,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 )
 
 const (
@@ -40,13 +38,13 @@ type AWSSigningTransport struct {
 	t      http.RoundTripper
 	creds  aws.CredentialsProvider
 	region string
-	log    log.Logger
+	log    *slog.Logger
 }
 
-func NewAWSSigningTransport(transport http.RoundTripper, region string, roleArn string, log log.Logger) (*AWSSigningTransport, error) {
+func NewAWSSigningTransport(transport http.RoundTripper, region string, roleArn string, log *slog.Logger) (*AWSSigningTransport, error) {
 	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion(region))
 	if err != nil {
-		_ = level.Error(log).Log("msg", "failed to load aws default config", "err", err)
+		log.Error("failed to load aws default config", "err", err)
 		return nil, err
 	}
 
@@ -59,7 +57,7 @@ func NewAWSSigningTransport(transport http.RoundTripper, region string, roleArn 
 	// are valid before returning the transport.
 	_, err = cfg.Credentials.Retrieve(context.Background())
 	if err != nil {
-		_ = level.Error(log).Log("msg", "failed to retrive aws credentials", "err", err)
+		log.Error("failed to retrive aws credentials", "err", err)
 		return nil, err
 	}
 
@@ -75,20 +73,20 @@ func (a *AWSSigningTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	signer := v4.NewSigner()
 	payloadHash, newReader, err := hashPayload(req.Body)
 	if err != nil {
-		_ = level.Error(a.log).Log("msg", "failed to hash request body", "err", err)
+		a.log.Error("failed to hash request body", "err", err)
 		return nil, err
 	}
 	req.Body = newReader
 
 	creds, err := a.creds.Retrieve(context.Background())
 	if err != nil {
-		_ = level.Error(a.log).Log("msg", "failed to retrieve aws credentials", "err", err)
+		a.log.Error("failed to retrieve aws credentials", "err", err)
 		return nil, err
 	}
 
 	err = signer.SignHTTP(context.Background(), creds, req, payloadHash, service, a.region, time.Now())
 	if err != nil {
-		_ = level.Error(a.log).Log("msg", "failed to sign request body", "err", err)
+		a.log.Error("failed to sign request body", "err", err)
 		return nil, err
 	}
 	return a.t.RoundTrip(req)
@@ -99,11 +97,11 @@ func hashPayload(r io.ReadCloser) (string, io.ReadCloser, error) {
 	payload := []byte("")
 	if r != nil {
 		defer r.Close()
-		payload, err := ioutil.ReadAll(r)
+		payload, err := io.ReadAll(r)
 		if err != nil {
 			return "", newReader, err
 		}
-		newReader = ioutil.NopCloser(bytes.NewReader(payload))
+		newReader = io.NopCloser(bytes.NewReader(payload))
 	}
 	hash := sha256.Sum256(payload)
 	payloadHash := hex.EncodeToString(hash[:])

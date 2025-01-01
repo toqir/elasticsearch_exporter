@@ -16,16 +16,16 @@ package collector
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/prometheus-community/elasticsearch_exporter/pkg/clusterinfo"
-	"github.com/prometheus/client_golang/prometheus"
-	"io/ioutil"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
 	"sort"
 	"strconv"
+
+	"github.com/prometheus-community/elasticsearch_exporter/pkg/clusterinfo"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 type labels struct {
@@ -56,7 +56,7 @@ type aliasMetric struct {
 
 // Indices information struct
 type Indices struct {
-	logger          log.Logger
+	logger          *slog.Logger
 	client          *http.Client
 	url             *url.URL
 	shards          bool
@@ -64,17 +64,13 @@ type Indices struct {
 	clusterInfoCh   chan *clusterinfo.Response
 	lastClusterInfo *clusterinfo.Response
 
-	up                prometheus.Gauge
-	totalScrapes      prometheus.Counter
-	jsonParseFailures prometheus.Counter
-
 	indexMetrics []*indexMetric
 	shardMetrics []*shardMetric
 	aliasMetrics []*aliasMetric
 }
 
 // NewIndices defines Indices Prometheus metrics
-func NewIndices(logger log.Logger, client *http.Client, url *url.URL, shards bool, includeAliases bool) *Indices {
+func NewIndices(logger *slog.Logger, client *http.Client, url *url.URL, shards bool, includeAliases bool) *Indices {
 
 	indexLabels := labels{
 		keys: func(...string) []string {
@@ -128,19 +124,6 @@ func NewIndices(logger log.Logger, client *http.Client, url *url.URL, shards boo
 		lastClusterInfo: &clusterinfo.Response{
 			ClusterName: "unknown_cluster",
 		},
-
-		up: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: prometheus.BuildFQName(namespace, "index_stats", "up"),
-			Help: "Was the last scrape of the Elasticsearch index endpoint successful.",
-		}),
-		totalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: prometheus.BuildFQName(namespace, "index_stats", "total_scrapes"),
-			Help: "Current total Elasticsearch index scrapes.",
-		}),
-		jsonParseFailures: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: prometheus.BuildFQName(namespace, "index_stats", "json_parse_failures"),
-			Help: "Number of errors while parsing JSON.",
-		}),
 
 		indexMetrics: []*indexMetric{
 			{
@@ -806,6 +789,30 @@ func NewIndices(logger log.Logger, client *http.Client, url *url.URL, shards boo
 			{
 				Type: prometheus.CounterValue,
 				Desc: prometheus.NewDesc(
+					prometheus.BuildFQName(namespace, "index_stats", "refresh_external_time_seconds_total"),
+					"Total external refresh time in seconds",
+					indexLabels.keys(), nil,
+				),
+				Value: func(indexStats IndexStatsIndexResponse) float64 {
+					return float64(indexStats.Total.Refresh.ExternalTotalTimeInMillis) / 1000
+				},
+				Labels: indexLabels,
+			},
+			{
+				Type: prometheus.CounterValue,
+				Desc: prometheus.NewDesc(
+					prometheus.BuildFQName(namespace, "index_stats", "refresh_external_total"),
+					"Total external refresh count",
+					indexLabels.keys(), nil,
+				),
+				Value: func(indexStats IndexStatsIndexResponse) float64 {
+					return float64(indexStats.Total.Refresh.ExternalTotal)
+				},
+				Labels: indexLabels,
+			},
+			{
+				Type: prometheus.CounterValue,
+				Desc: prometheus.NewDesc(
 					prometheus.BuildFQName(namespace, "index_stats", "refresh_total"),
 					"Total refresh count",
 					indexLabels.keys(), nil,
@@ -1065,14 +1072,14 @@ func NewIndices(logger log.Logger, client *http.Client, url *url.URL, shards boo
 
 	// start go routine to fetch clusterinfo updates and save them to lastClusterinfo
 	go func() {
-		_ = level.Debug(logger).Log("msg", "starting cluster info receive loop")
+		logger.Debug("starting cluster info receive loop")
 		for ci := range indices.clusterInfoCh {
 			if ci != nil {
-				_ = level.Debug(logger).Log("msg", "received cluster info update", "cluster", ci.ClusterName)
+				logger.Debug("received cluster info update", "cluster", ci.ClusterName)
 				indices.lastClusterInfo = ci
 			}
 		}
-		_ = level.Debug(logger).Log("msg", "exiting cluster info receive loop")
+		logger.Debug("exiting cluster info receive loop")
 	}()
 	return indices
 }
@@ -1093,9 +1100,10 @@ func (i *Indices) Describe(ch chan<- *prometheus.Desc) {
 	for _, metric := range i.indexMetrics {
 		ch <- metric.Desc
 	}
-	ch <- i.up.Desc()
-	ch <- i.totalScrapes.Desc()
-	ch <- i.jsonParseFailures.Desc()
+	for _, metric := range i.aliasMetrics {
+		ch <- metric.Desc
+	}
+
 }
 
 func (i *Indices) fetchAndDecodeIndexStats() (indexStatsResponse, error) {
@@ -1115,7 +1123,6 @@ func (i *Indices) fetchAndDecodeIndexStats() (indexStatsResponse, error) {
 	}
 
 	if err := json.Unmarshal(bts, &isr); err != nil {
-		i.jsonParseFailures.Inc()
 		return isr, err
 	}
 
@@ -1123,7 +1130,7 @@ func (i *Indices) fetchAndDecodeIndexStats() (indexStatsResponse, error) {
 		isr.Aliases = map[string][]string{}
 		asr, err := i.fetchAndDecodeAliases()
 		if err != nil {
-			_ = level.Error(i.logger).Log("err", err.Error())
+			i.logger.Error("error getting alias information", "err", err)
 			return isr, err
 		}
 
@@ -1155,7 +1162,6 @@ func (i *Indices) fetchAndDecodeAliases() (aliasesResponse, error) {
 	}
 
 	if err := json.Unmarshal(bts, &asr); err != nil {
-		i.jsonParseFailures.Inc()
 		return asr, err
 	}
 
@@ -1172,8 +1178,8 @@ func (i *Indices) queryURL(u *url.URL) ([]byte, error) {
 	defer func() {
 		err = res.Body.Close()
 		if err != nil {
-			_ = level.Warn(i.logger).Log(
-				"msg", "failed to close http.Client",
+			i.logger.Warn(
+				"failed to close http.Client",
 				"err", err,
 			)
 		}
@@ -1183,7 +1189,7 @@ func (i *Indices) queryURL(u *url.URL) ([]byte, error) {
 		return []byte{}, fmt.Errorf("HTTP Request failed with code %d", res.StatusCode)
 	}
 
-	bts, err := ioutil.ReadAll(res.Body)
+	bts, err := io.ReadAll(res.Body)
 	if err != nil {
 		return []byte{}, err
 	}
@@ -1193,24 +1199,15 @@ func (i *Indices) queryURL(u *url.URL) ([]byte, error) {
 
 // Collect gets Indices metric values
 func (i *Indices) Collect(ch chan<- prometheus.Metric) {
-	i.totalScrapes.Inc()
-	defer func() {
-		ch <- i.up
-		ch <- i.totalScrapes
-		ch <- i.jsonParseFailures
-	}()
-
 	// indices
 	indexStatsResp, err := i.fetchAndDecodeIndexStats()
 	if err != nil {
-		i.up.Set(0)
-		_ = level.Warn(i.logger).Log(
-			"msg", "failed to fetch and decode index stats",
+		i.logger.Warn(
+			"failed to fetch and decode index stats",
 			"err", err,
 		)
 		return
 	}
-	i.up.Set(1)
 
 	// Alias stats
 	if i.aliases {
