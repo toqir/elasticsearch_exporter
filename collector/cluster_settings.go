@@ -16,12 +16,14 @@ package collector
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
-	"github.com/go-kit/log"
 	"github.com/imdario/mergo"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -31,12 +33,12 @@ func init() {
 }
 
 type ClusterSettingsCollector struct {
-	logger log.Logger
+	logger *slog.Logger
 	u      *url.URL
 	hc     *http.Client
 }
 
-func NewClusterSettings(logger log.Logger, u *url.URL, hc *http.Client) (Collector, error) {
+func NewClusterSettings(logger *slog.Logger, u *url.URL, hc *http.Client) (Collector, error) {
 	return &ClusterSettingsCollector{
 		logger: logger,
 		u:      u,
@@ -54,6 +56,48 @@ var clusterSettingsDesc = map[string]*prometheus.Desc{
 	"maxShardsPerNode": prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "clustersettings_stats", "max_shards_per_node"),
 		"Current maximum number of shards per node setting.",
+		nil, nil,
+	),
+
+	"thresholdEnabled": prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "clustersettings_allocation", "threshold_enabled"),
+		"Is disk allocation decider enabled.",
+		nil, nil,
+	),
+
+	"floodStageRatio": prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "clustersettings_allocation_watermark", "flood_stage_ratio"),
+		"Flood stage watermark as a ratio.",
+		nil, nil,
+	),
+
+	"highRatio": prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "clustersettings_allocation_watermark", "high_ratio"),
+		"High watermark for disk usage as a ratio.",
+		nil, nil,
+	),
+
+	"lowRatio": prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "clustersettings_allocation_watermark", "low_ratio"),
+		"Low watermark for disk usage as a ratio.",
+		nil, nil,
+	),
+
+	"floodStageBytes": prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "clustersettings_allocation_watermark", "flood_stage_bytes"),
+		"Flood stage watermark as in bytes.",
+		nil, nil,
+	),
+
+	"highBytes": prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "clustersettings_allocation_watermark", "high_bytes"),
+		"High watermark for disk usage in bytes.",
+		nil, nil,
+	),
+
+	"lowBytes": prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "clustersettings_allocation_watermark", "low_bytes"),
+		"Low watermark for disk usage in bytes.",
 		nil, nil,
 	),
 }
@@ -84,16 +128,21 @@ type clusterSettingsRouting struct {
 
 // clusterSettingsAllocation is a representation of a Elasticsearch Cluster shard routing allocation settings
 type clusterSettingsAllocation struct {
-	Enabled string `json:"enable"`
+	Enabled string              `json:"enable"`
+	Disk    clusterSettingsDisk `json:"disk"`
 }
 
-// ClusterSettings information struct
-type ClusterSettings struct {
-	logger log.Logger
-	client *http.Client
-	url    *url.URL
+// clusterSettingsDisk is a representation of a Elasticsearch Cluster shard routing disk allocation settings
+type clusterSettingsDisk struct {
+	ThresholdEnabled string                   `json:"threshold_enabled"`
+	Watermark        clusterSettingsWatermark `json:"watermark"`
+}
 
-	maxShardsPerNode prometheus.Gauge
+// clusterSettingsWatermark is representation of Elasticsearch Cluster shard routing disk allocation watermark settings
+type clusterSettingsWatermark struct {
+	FloodStage string `json:"flood_stage"`
+	High       string `json:"high"`
+	Low        string `json:"low"`
 }
 
 func (c *ClusterSettingsCollector) Update(ctx context.Context, ch chan<- prometheus.Metric) error {
@@ -112,7 +161,7 @@ func (c *ClusterSettingsCollector) Update(ctx context.Context, ch chan<- prometh
 		return err
 	}
 	defer resp.Body.Close()
-	b, err := ioutil.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -160,5 +209,137 @@ func (c *ClusterSettingsCollector) Update(ctx context.Context, ch chan<- prometh
 		float64(shardAllocationMap[merged.Cluster.Routing.Allocation.Enabled]),
 	)
 
+	// Threshold enabled
+	thresholdMap := map[string]int{
+		"false": 0,
+		"true":  1,
+	}
+
+	ch <- prometheus.MustNewConstMetric(
+		clusterSettingsDesc["thresholdEnabled"],
+		prometheus.GaugeValue,
+		float64(thresholdMap[merged.Cluster.Routing.Allocation.Disk.ThresholdEnabled]),
+	)
+
+	// Watermark bytes or ratio metrics
+	if strings.HasSuffix(merged.Cluster.Routing.Allocation.Disk.Watermark.High, "b") {
+		flooodStageBytes, err := getValueInBytes(merged.Cluster.Routing.Allocation.Disk.Watermark.FloodStage)
+		if err != nil {
+			c.logger.Error("failed to parse flood_stage bytes", "err", err)
+		} else {
+			ch <- prometheus.MustNewConstMetric(
+				clusterSettingsDesc["floodStageBytes"],
+				prometheus.GaugeValue,
+				flooodStageBytes,
+			)
+		}
+
+		highBytes, err := getValueInBytes(merged.Cluster.Routing.Allocation.Disk.Watermark.High)
+		if err != nil {
+			c.logger.Error("failed to parse high bytes", "err", err)
+		} else {
+			ch <- prometheus.MustNewConstMetric(
+				clusterSettingsDesc["highBytes"],
+				prometheus.GaugeValue,
+				highBytes,
+			)
+		}
+
+		lowBytes, err := getValueInBytes(merged.Cluster.Routing.Allocation.Disk.Watermark.Low)
+		if err != nil {
+			c.logger.Error("failed to parse low bytes", "err", err)
+		} else {
+			ch <- prometheus.MustNewConstMetric(
+				clusterSettingsDesc["lowBytes"],
+				prometheus.GaugeValue,
+				lowBytes,
+			)
+		}
+
+		return nil
+	}
+
+	// Watermark ratio metrics
+	floodRatio, err := getValueAsRatio(merged.Cluster.Routing.Allocation.Disk.Watermark.FloodStage)
+	if err != nil {
+		c.logger.Error("failed to parse flood_stage ratio", "err", err)
+	} else {
+		ch <- prometheus.MustNewConstMetric(
+			clusterSettingsDesc["floodStageRatio"],
+			prometheus.GaugeValue,
+			floodRatio,
+		)
+	}
+
+	highRatio, err := getValueAsRatio(merged.Cluster.Routing.Allocation.Disk.Watermark.High)
+	if err != nil {
+		c.logger.Error("failed to parse high ratio", "err", err)
+	} else {
+		ch <- prometheus.MustNewConstMetric(
+			clusterSettingsDesc["highRatio"],
+			prometheus.GaugeValue,
+			highRatio,
+		)
+	}
+
+	lowRatio, err := getValueAsRatio(merged.Cluster.Routing.Allocation.Disk.Watermark.Low)
+	if err != nil {
+		c.logger.Error("failed to parse low ratio", "err", err)
+	} else {
+		ch <- prometheus.MustNewConstMetric(
+			clusterSettingsDesc["lowRatio"],
+			prometheus.GaugeValue,
+			lowRatio,
+		)
+	}
+
 	return nil
+}
+
+func getValueInBytes(value string) (float64, error) {
+	type UnitValue struct {
+		unit string
+		val  float64
+	}
+
+	unitValues := []UnitValue{
+		{"pb", 1024 * 1024 * 1024 * 1024 * 1024},
+		{"tb", 1024 * 1024 * 1024 * 1024},
+		{"gb", 1024 * 1024 * 1024},
+		{"mb", 1024 * 1024},
+		{"kb", 1024},
+		{"b", 1},
+	}
+
+	for _, uv := range unitValues {
+		if strings.HasSuffix(value, uv.unit) {
+			numberStr := strings.TrimSuffix(value, uv.unit)
+
+			number, err := strconv.ParseFloat(numberStr, 64)
+			if err != nil {
+				return 0, err
+			}
+			return number * uv.val, nil
+		}
+	}
+
+	return 0, fmt.Errorf("failed to convert unit %s to bytes", value)
+}
+
+func getValueAsRatio(value string) (float64, error) {
+	if strings.HasSuffix(value, "%") {
+		percentValue, err := strconv.Atoi(strings.TrimSpace(strings.TrimSuffix(value, "%")))
+		if err != nil {
+			return 0, err
+		}
+
+		return float64(percentValue) / 100, nil
+	}
+
+	ratio, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return ratio, nil
 }

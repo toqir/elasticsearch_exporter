@@ -1,5 +1,44 @@
-## Unreleased
-* [BREAKING] Rename --es.cluster_settings to --collector.clustersettings
+## master / unreleased
+
+BREAKING CHANGES:
+
+The flag `--es.slm` has been renamed to `--collector.slm`.
+
+The logging system has been replaced with log/slog from the stdlib. This change is being made across the prometheus ecosystem. The logging output has changed, but the messages and levels remain the same. The `ts` label for the timestamp has bewen replaced with `time`, the accuracy is less, and the timezone is not forced to UTC. The `caller` field has been replaced by the `source` field, which now includes the full path to the source file. The `level` field now exposes the log level in capital letters.
+
+* [CHANGE] Rename --es.slm to --collector.slm #932
+* [CHANGE] Replace logging system #942
+
+## 1.8.0 / 2024-09-14
+
+* [FEATURE] Add tasks action collector. Enable using `--collector.tasks.actions`. #778
+* [FEATURE] Add additional nodes metrics for indexing pressure monitoring. #904
+
+## 1.7.0 / 2023-12-02
+
+BREAKING CHANGES:
+
+The flag `--es.snapshots` has been renamed to `--collector.snapshots`.
+
+* [CHANGE] Rename --es.snapshots to --collector.snapshots #789
+* [CHANGE] Add cluster label to `elasticsearch_node_shards_total` metric #639
+* [FEATURE] Add watermark metrics #611
+* [FEATURE] Add `elasticsearch_indices_settings_creation_timestamp_seconds` metric #816
+
+## 1.6.0 / 2023-06-22
+
+BREAKING CHANGES:
+
+The flag `--es.cluster_settings` has been renamed to `--collector.clustersettings`.
+
+* [CHANGE] Rename --es.cluster_settings to --collector.clustersettings
+* [FEATURE] Add ILM metrics #513
+* [ENHANCEMENT] Add ElasticCloud node roles to role label #652
+* [ENHANCEMENT] Add ability to use AWS IAM role for authentication #653
+* [ENHANCEMENT] Add metric for index replica count #483
+* [BUGFIX] Set elasticsearch_clusterinfo_version_info guage to 1 #728
+* [BUGFIX] Fix index field counts with nested fields #675
+
 
 ## 1.5.0 / 2022-07-28
 

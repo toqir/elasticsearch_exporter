@@ -16,13 +16,12 @@ package collector
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -39,12 +38,9 @@ type ilmStatusMetric struct {
 
 // IlmStatusCollector information struct
 type IlmStatusCollector struct {
-	logger log.Logger
+	logger *slog.Logger
 	client *http.Client
 	url    *url.URL
-
-	up                              prometheus.Gauge
-	totalScrapes, jsonParseFailures prometheus.Counter
 
 	metric ilmStatusMetric
 }
@@ -54,7 +50,7 @@ type IlmStatusResponse struct {
 }
 
 // NewIlmStatus defines Indices IndexIlms Prometheus metrics
-func NewIlmStatus(logger log.Logger, client *http.Client, url *url.URL) *IlmStatusCollector {
+func NewIlmStatus(logger *slog.Logger, client *http.Client, url *url.URL) *IlmStatusCollector {
 	subsystem := "ilm"
 
 	return &IlmStatusCollector{
@@ -62,24 +58,12 @@ func NewIlmStatus(logger log.Logger, client *http.Client, url *url.URL) *IlmStat
 		client: client,
 		url:    url,
 
-		up: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: prometheus.BuildFQName(namespace, subsystem, "up"),
-			Help: "Was the last scrape of the ElasticSearch Indices Ilms endpoint successful.",
-		}),
-		totalScrapes: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: prometheus.BuildFQName(namespace, subsystem, "scrapes_total"),
-			Help: "Current total ElasticSearch Indices Ilms scrapes.",
-		}),
-		jsonParseFailures: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: prometheus.BuildFQName(namespace, subsystem, "json_parse_failures_total"),
-			Help: "Number of errors while parsing JSON.",
-		}),
 		metric: ilmStatusMetric{
 			Type: prometheus.GaugeValue,
 			Desc: prometheus.NewDesc(
 				prometheus.BuildFQName(namespace, subsystem, "status"),
-				"Current status of ilm. Status can be STOPPED, RUNNING, STOPPING.",
-				ilmStatuses, nil,
+				"Current status of ILM. Status can be STOPPED, RUNNING, STOPPING.",
+				[]string{"operation_mode"}, nil,
 			),
 			Value: func(ilm *IlmStatusResponse, status string) float64 {
 				if ilm.OperationMode == status {
@@ -94,9 +78,6 @@ func NewIlmStatus(logger log.Logger, client *http.Client, url *url.URL) *IlmStat
 // Describe add Snapshots metrics descriptions
 func (im *IlmStatusCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- im.metric.Desc
-	ch <- im.up.Desc()
-	ch <- im.totalScrapes.Desc()
-	ch <- im.jsonParseFailures.Desc()
 }
 
 func (im *IlmStatusCollector) fetchAndDecodeIlm() (*IlmStatusResponse, error) {
@@ -113,21 +94,20 @@ func (im *IlmStatusCollector) fetchAndDecodeIlm() (*IlmStatusResponse, error) {
 		return nil, fmt.Errorf("HTTP Request failed with code %d", res.StatusCode)
 	}
 
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
-		_ = level.Warn(im.logger).Log("msg", "failed to read response body", "err", err)
+		im.logger.Warn("failed to read response body", "err", err)
 		return nil, err
 	}
 
 	err = res.Body.Close()
 	if err != nil {
-		_ = level.Warn(im.logger).Log("msg", "failed to close response body", "err", err)
+		im.logger.Warn("failed to close response body", "err", err)
 		return nil, err
 	}
 
 	var imr IlmStatusResponse
 	if err := json.Unmarshal(body, &imr); err != nil {
-		im.jsonParseFailures.Inc()
 		return nil, err
 	}
 
@@ -136,24 +116,14 @@ func (im *IlmStatusCollector) fetchAndDecodeIlm() (*IlmStatusResponse, error) {
 
 // Collect gets all indices Ilms metric values
 func (im *IlmStatusCollector) Collect(ch chan<- prometheus.Metric) {
-
-	im.totalScrapes.Inc()
-	defer func() {
-		ch <- im.up
-		ch <- im.totalScrapes
-		ch <- im.jsonParseFailures
-	}()
-
 	indicesIlmsResponse, err := im.fetchAndDecodeIlm()
 	if err != nil {
-		im.up.Set(0)
-		_ = level.Warn(im.logger).Log(
-			"msg", "failed to fetch and decode cluster ilm status",
+		im.logger.Warn(
+			"failed to fetch and decode cluster ilm status",
 			"err", err,
 		)
 		return
 	}
-	im.up.Set(1)
 
 	for _, status := range ilmStatuses {
 		ch <- prometheus.MustNewConstMetric(
